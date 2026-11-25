@@ -233,18 +233,11 @@ lays them out and styles them.
 
 ## Install
 
-The package isn't on a registry. Apps vendor a tarball, the way they vendor `@misofm/sdk`:
-
 ```sh
-# in this repo: build dist/ and pack it as npm would publish it (dist-pack/misofm-privy-auth.tgz)
-bun run pack
-# in an app with scripts/vendor-privy-auth.sh (app-v2, studio-v2): build, pack into vendor/, reinstall
-scripts/vendor-privy-auth.sh ../privy-auth
+npm install --save-exact @misofm/privy-auth
 ```
 
-The app's `package.json` then has `"@misofm/privy-auth": "file:./vendor/misofm-privy-auth.tgz"`,
-with the tarball committed. A tarball rather than `file:../privy-auth`: a directory dependency
-brings its own `node_modules`, and with them second copies of the peers.
+Pin it exactly, as its peers are pinned.
 
 Peer dependencies:
 
@@ -260,7 +253,7 @@ No runtime dependencies.
 ## Integrating a new product
 
 1. Add the product's origins (production and dev) to the production Privy app's allowed domains.
-2. Vendor the tarball (above). Install `effect` 4.1.x, `react` 19, `@privy-io/react-auth` `3.52.0`
+2. Install `@misofm/privy-auth` (above), `effect` 4.1.x, `react` 19, `@privy-io/react-auth` `3.52.0`
    and `@ui-sdk/react` + `@ui-sdk/core` `0.1.0-beta.17`, plus `@mysten/sui` `2.38.0` if the
    product signs.
 3. Mount `PrivyProvider` with `appId` from the build config and

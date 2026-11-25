@@ -62,9 +62,10 @@ Read `README.md` first. It covers the entries, the API, the design split and the
   `test/dom.ts`, which keeps Bun's own `fetch`, `Response`, `crypto` and timers); Privy's SDK is
   `mock.module`d; a hook's runtime is `Effect.runForkWith` over a `TestClock` context. The flow
   (`sign-in-flow.ts`) is tested as Effects without React.
-- **Distribution:** `bun run pack` builds `dist-pack/misofm-privy-auth.tgz`. Apps vendor it with
-  their `scripts/vendor-privy-auth.sh` and commit the tarball. Bump `version` on a breaking
-  change, and re-vendor both apps together.
+- **Distribution:** public on npm as `@misofm/privy-auth` (MIT). `npm publish` builds `dist`
+  first (`prepublishOnly`); `bun run pack` makes the same tarball locally. Bump `version` for
+  every publish (a breaking change bumps the minor while it is 0.x), and move both apps to it
+  together.
 - **Before handing off:** run `bun run typecheck`, `bun run test` and `bun run build`, all clean.
 - Git has no identity configured here: commit with
   `git -c user.name=BL -c user.email=bl@miso.fm commit`.
