@@ -6,9 +6,9 @@
  * A token is accepted when it is a compact JWS signed ES256 by Privy (`PrivyKeys`: the app's
  * verification key, or a key from its JWKS named by `kid`), issued by `privy.io` for `appId` (its
  * `aud`), not past `exp` (30 s of clock skew allowed), with a `sub` (Privy's user ID), and its
- * `linked_accounts` naming the account's Privy embedded Sui wallet.
+ * `linked_accounts` naming the account's Privy embedded Sui wallet (at a Sui address).
  */
-import { Array as Arr, Clock, Context, Effect, Exit, Layer, Option, Ref, Schema, Semaphore } from 'effect';
+import { Array as Arr, Clock, Context, Effect, Exit, Layer, Option, Ref, Schedule, Schema, Semaphore } from 'effect';
 
 import { normalizeSuiAddress } from './address.js';
 import { jwtPart, LinkedAccountsJson } from './token.js';
@@ -19,7 +19,11 @@ export type VerifiedIdentity = {
   readonly userId: string;
   /** The account's Privy embedded Sui wallet, normalized (`0x`, 64 lowercase hex digits). */
   readonly address: string;
-  /** The email Privy verified: the email login's, else the Google or Apple login's. */
+  /**
+   * The email Privy verified: the email login's, else the Google or Apple login's. Not who the
+   * account is: two accounts can carry one address (an emailed code's, and Google's). Key an
+   * account by `userId` or `address`.
+   */
   readonly email: Option.Option<string>;
   /** When the token ends (`exp`), ms since the epoch. */
   readonly expiresAt: number;
@@ -64,7 +68,12 @@ const PRIVY_ISSUER = 'privy.io';
 const SKEW_SECONDS = 30;
 /** The shortest wait before the JWKS is fetched again for an unknown `kid`. */
 const KEYS_REFETCH_MS = 60_000;
+/** How long the JWKS may take in all: every try, and the waits between. */
 const JWKS_TIMEOUT = '5 seconds';
+/** How long one try at the JWKS may take. */
+const JWKS_TRY_TIMEOUT = '2 seconds';
+/** A try another may do better than is made again, twice at most: about 100 ms later, then 200 ms (jittered). */
+const JWKS_RETRY = { schedule: Schedule.jittered(Schedule.exponential('100 millis')), times: 2, while: (failed: JwksTryFailed) => failed.again };
 const ECDSA_P256 = { name: 'ECDSA', namedCurve: 'P-256' } as const;
 
 /** One of Privy's keys in its JWKS (others, such as RSA keys, are skipped). */
@@ -87,12 +96,25 @@ export type JwksOptions = {
 
 const unavailable = (cause: unknown) => new PrivyKeysUnavailable({ cause });
 
-/** The JSON a URL answers with a 2xx, through `fetch`; anything else (no answer, a status, not JSON, a timeout) is `PrivyKeysUnavailable`. */
+/** One try at a URL failed. `again`: another may do better (no answer, a 5xx, a 429), unlike a refusal or a body that isn't JSON. */
+class JwksTryFailed extends Schema.TaggedError<JwksTryFailed>()('JwksTryFailed', { cause: Schema.Defect(), again: Schema.Boolean }) {}
+const tryFailed = (again: boolean) => (cause: unknown) => new JwksTryFailed({ cause, again });
+
+/**
+ * The JSON a URL answers with a 2xx, through `fetch`. A try that gets no answer in 2 s, a 5xx or a
+ * 429 is made again (`JWKS_RETRY`); anything else (a refusal, not JSON), three failed tries, or
+ * 5 s in all, is `PrivyKeysUnavailable`.
+ */
 const fetchJson = (fetch: Fetch, url: string) =>
-  Effect.tryPromise({ try: (signal) => fetch(url, { signal }), catch: unavailable }).pipe(
+  Effect.tryPromise({ try: (signal) => fetch(url, { signal }), catch: tryFailed(true) }).pipe(
     Effect.flatMap((response) =>
-      response.ok ? Effect.tryPromise({ try: () => response.json() as Promise<unknown>, catch: unavailable }) : Effect.fail(unavailable(new Error(`HTTP ${response.status}`))),
+      response.ok
+        ? Effect.tryPromise({ try: () => response.json() as Promise<unknown>, catch: tryFailed(false) })
+        : Effect.fail(tryFailed(response.status >= 500 || response.status === 429)(new Error(`HTTP ${response.status}`))),
     ),
+    Effect.timeoutOrElse({ duration: JWKS_TRY_TIMEOUT, orElse: () => Effect.fail(tryFailed(true)(new Error(`No answer in ${JWKS_TRY_TIMEOUT}`))) }),
+    Effect.retry(JWKS_RETRY),
+    Effect.mapError((failed) => unavailable(failed.cause)),
     Effect.timeoutOrElse({ duration: JWKS_TIMEOUT, orElse: () => Effect.fail(unavailable(new Error(`No answer in ${JWKS_TIMEOUT}`))) }),
   );
 
@@ -122,30 +144,54 @@ export class PrivyKeys extends Context.Service<
    * The app's keys from its JWKS (`https://auth.privy.io/api/v1/apps/<appId>/jwks.json`, through
    * `options.fetch`, the global `fetch` by default), as the service itself: fetched on first use,
    * kept, and fetched again (at most once a minute by `Clock`) when a token names an unknown
-   * `kid`. A failed fetch is not kept: the next call tries again. Times out after 5 s. Make it once
-   * per isolate and keep it, so the keys are fetched once.
+   * `kid`. A fetch that gets no answer, a 5xx or a 429 is tried again twice, shortly after (5 s in
+   * all, each try 2 s). The first fetch failing is not kept (the next call tries again), nor is a
+   * JWKS with no key that can verify; a key that won't import is skipped. A later fetch failing
+   * takes no key away: tokens of known keys still verify, and the token naming the unknown one
+   * fails with `PrivyKeysUnavailable` (for that minute). Make it once per isolate and keep it, so
+   * the keys are fetched once.
    */
   static readonly makeJwks = (appId: string, options: JwksOptions = {}): Effect.Effect<PrivyKeys['Service']> =>
     Effect.gen(function* () {
       const fetch = options.fetch ?? ((url, init) => globalThis.fetch(url, init));
-      const fetchedAt = yield* Ref.make(0);
+      /** The keys last read (kept while a later fetch fails), and the last fetch for an unknown `kid`: when, and how it failed. */
+      const kept = yield* Ref.make(Option.none<ReadonlyMap<string, CryptoKey>>());
+      const asked = yield* Ref.make({ at: 0, failure: Option.none<PrivyKeysUnavailable>() });
       const refetching = yield* Semaphore.make(1);
       const fetchKeys = fetchJson(fetch, `https://auth.privy.io/api/v1/apps/${encodeURIComponent(appId)}/jwks.json`).pipe(
         Effect.flatMap((json) => decodeJwks(json).pipe(Effect.mapError(unavailable))),
+        // A key that won't import is skipped, so one bad key doesn't take the others with it.
         Effect.flatMap(({ keys }) =>
-          Effect.forEach(Arr.getSomes(keys.map((jwk) => decodeEcJwk(jwk))), ({ kid, kty, crv, x, y }) => Effect.map(importKey('jwk', { kty, crv, x, y }), (key) => [kid, key] as const)),
+          Effect.forEach(Arr.getSomes(keys.map((jwk) => decodeEcJwk(jwk))), ({ kid, kty, crv, x, y }) =>
+            importKey('jwk', { kty, crv, x, y }).pipe(
+              Effect.map((key) => [kid, key] as const),
+              Effect.option,
+            ),
+          ),
         ),
-        Effect.map((entries) => new Map(entries)),
-        Effect.tap(() => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Ref.set(fetchedAt, now)))),
+        Effect.map((entries): ReadonlyMap<string, CryptoKey> => new Map(Arr.getSomes(entries))),
+        // No key at all would turn every sign-in away as `UnknownKey`: that is Privy's keys unread, not the tokens' fault.
+        Effect.filterOrFail(
+          (keys) => keys.size > 0,
+          () => unavailable(new Error('The JWKS has no key that can verify')),
+        ),
+        Effect.tap((keys) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Effect.andThen(Ref.set(kept, Option.some(keys)), Ref.set(asked, { at: now, failure: Option.none() }))))),
         Effect.withSpan('PrivyKeys.fetchJwks'),
       );
-      const [keys, forget] = yield* Effect.cachedInvalidateWithTTL(fetchKeys, (exit) => (Exit.isSuccess(exit) ? 'Infinity' : 0));
-      /** The keys fetched again, unless they were less than a minute ago (by this call or another). */
+      /** The first fetch, shared by every call made meanwhile; a failed one is made again by the next call. */
+      const [first] = yield* Effect.cachedInvalidateWithTTL(fetchKeys, (exit) => (Exit.isSuccess(exit) ? 'Infinity' : 0));
+      const keys = Ref.get(kept).pipe(Effect.flatMap(Option.match({ onNone: () => first, onSome: Effect.succeed })));
+      /**
+       * The keys fetched again for an unknown `kid`, at most once a minute (by this call or
+       * another, whether or not it worked). The keys kept stay until others are read: a fetch that
+       * fails takes nothing away, and fails only the token that asked.
+       */
       const refetch = refetching.withPermit(
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis;
-          if (now - (yield* Ref.get(fetchedAt)) > KEYS_REFETCH_MS) yield* forget;
-          return yield* keys;
+          const last = yield* Ref.get(asked);
+          if (now - last.at <= KEYS_REFETCH_MS) return yield* Option.match(last.failure, { onNone: () => keys, onSome: Effect.fail });
+          return yield* fetchKeys.pipe(Effect.tapError((failure) => Ref.set(asked, { at: now, failure: Option.some(failure) })));
         }),
       );
       const get = Effect.fn('PrivyKeys.get')(function* (kid: Option.Option<string>) {
@@ -180,7 +226,7 @@ const Header = Schema.Struct({ alg: Schema.Literal('ES256'), kid: Schema.optiona
 const Claims = Schema.Struct({
   iss: Schema.String,
   aud: Schema.String,
-  sub: Schema.String,
+  sub: Schema.NonEmptyString,
   exp: Schema.Finite,
   linked_accounts: Schema.optional(LinkedAccountsJson),
 });
@@ -188,11 +234,11 @@ const decodeHeader = Schema.decodeUnknownEffect(jwtPart(Header));
 const decodeClaims = Schema.decodeUnknownEffect(jwtPart(Claims));
 const decodeSignature = Schema.decodeUnknownEffect(Schema.Uint8ArrayFromBase64Url);
 
-/** A linked account in a token that is a Privy embedded Sui wallet (`wallet_client_type` absent, null or Privy's). */
+/** A linked account in a token that is a Privy embedded Sui wallet (`wallet_client_type` absent, null or Privy's), its address one (hex, 32 bytes at most). */
 const TokenSuiWallet = Schema.Struct({
   type: Schema.Literal('wallet'),
   chain_type: Schema.Literal('sui'),
-  address: Schema.String,
+  address: Schema.String.check(Schema.isPattern(/^(0x)?[0-9a-fA-F]{1,64}$/)),
   wallet_client_type: Schema.optional(Schema.NullOr(Schema.String.check(Schema.isStartingWith('privy')))),
 });
 const VerifiedEmail = Schema.String.check(Schema.isIncluding('@'));

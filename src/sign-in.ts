@@ -8,6 +8,7 @@ import {
   initialFlowState,
   isEmailAddress,
   makeSignInFlow,
+  sentCode,
   type SignInActions,
   type SignInFlowState,
   type SignInStep,
@@ -35,14 +36,21 @@ export interface UseSignInOptions<R> {
 
 /** The sign-in screen's state and what it can do, for one render. */
 export interface SignIn<E> {
+  /** The flow's state itself, one of six (what follows is read from it; `returning` is the app's, beside it). */
+  readonly state: SignInFlowState<E>;
+  /** Which form shows: `email` while `state` is `Email`, `Sending` or `Leaving`, else `code`. */
   readonly step: SignInStep;
   readonly email: string;
+  /** Takes what is typed while `state` is `Email`. */
   readonly setEmail: (email: string) => void;
   /** Why the email was refused before anything was sent (shown on its field until it changes). */
   readonly emailProblem: Option.Option<EmailProblem>;
-  /** Sends a code to the trimmed email, once it is an address. */
+  /** Sends a code to the trimmed email, once it is an address (none, when the last code went there less than the resend wait ago: that one stands). */
   readonly submitEmail: () => void;
+  /** The address the code went to (trimmed), once one has been sent. */
+  readonly sentTo: Option.Option<string>;
   readonly code: string;
+  /** Takes what is typed while `state` is `Code`. */
   readonly setCode: (code: string) => void;
   /** Signs in with `code` (by default the one typed), once it has `codeLength` digits. */
   readonly submitCode: (code?: string) => void;
@@ -54,6 +62,8 @@ export interface SignIn<E> {
   readonly differentEmail: () => void;
   /** Leaves for Google's or Apple's sign-in. */
   readonly continueWith: (provider: OAuthProvider) => void;
+  /** Back to the email step with nothing showing, the email kept: also from a page that never left for the provider. */
+  readonly startOver: () => void;
   /** A code is being sent. */
   readonly sending: boolean;
   /** The code is being checked. */
@@ -121,12 +131,16 @@ class FlowHost<E extends TaggedFailure, R> {
 /**
  * The sign-in screen's state machine, for an app's own screen over Privy's headless sign-in: an
  * email and the code Privy sends it (`codeLength` digits; another after `RESEND_SECONDS`), or Google
- * or Apple. `actions` are the app's own Effects, run with `options.run`. Each failure shows once:
- * a `WrongCode` as the code field's (`codeFailure`), any other in the alert line (`alert`); an
- * email missing or malformed is `emailProblem`, and nothing is sent. Starting anything clears the
- * failure shown; editing the email clears a send's failure, editing the code a send's or the
- * code's. A provider's button stays busy once its action succeeds (the page is leaving), until
- * the page comes back from the back/forward cache. Programs stop when the screen unmounts.
+ * or Apple. `actions` are the app's own Effects, run with `options.run`. The screen is in one
+ * `state` at a time; while it waits on an action it takes no input and starts nothing else. Each
+ * failure shows once: a `WrongCode` as the code field's (`codeFailure`), any other in the alert
+ * line (`alert`); an email missing or malformed is `emailProblem`, and nothing is sent. Starting
+ * anything clears the failure shown; editing the email clears a send's failure, editing the code
+ * the code step's. A provider's button stays busy once its action succeeds (the page is leaving),
+ * until the page comes back from the back/forward cache. An accepted code is spent: its field is
+ * emptied and another can be sent at once, and what the app does next (and holding the screen
+ * meanwhile) is the app's. Programs stop when the screen unmounts; mounted again, a screen that
+ * was waiting takes input again.
  */
 export function useSignIn<E extends TaggedFailure, R = never>(actions: SignInActions<E, R>, options: UseSignInOptions<R>): SignIn<E> {
   const latest = useRef<Latest<E, R>>({ actions, options });
@@ -144,28 +158,30 @@ export function useSignIn<E extends TaggedFailure, R = never>(actions: SignInAct
       Option.map(host.flow, (flow) => latest.current.options.run(pick(flow)(...args)));
     };
 
-  const running = Option.getOrUndefined(state.running);
-  const leaving = running === 'google' || running === 'apple' ? running : undefined;
-  const failure = Option.getOrUndefined(state.failure)?.error;
+  const sent = sentCode(state);
+  const failure = state._tag === 'Email' || state._tag === 'Code' ? Option.getOrUndefined(state.failure)?.error : undefined;
   const wrongCode = failure !== undefined && failure._tag === 'WrongCode';
   return {
-    step: state.step,
+    state,
+    step: state._tag === 'Email' || state._tag === 'Sending' || state._tag === 'Leaving' ? 'email' : 'code',
     email: state.email,
     setEmail: command((flow) => flow.setEmail, true),
-    emailProblem: state.emailProblem,
+    emailProblem: state._tag === 'Email' ? state.emailProblem : Option.none(),
     submitEmail: command((flow) => () => flow.submitEmail),
-    code: state.code,
+    sentTo: Option.map(sent, (code) => code.to),
+    code: 'code' in state ? state.code : '',
     setCode: command((flow) => flow.setCode, true),
     submitCode: command((flow) => (code?: string) => flow.submitCode(code)),
     codeLength: CODE_LENGTH,
-    resendIn: state.resendIn,
+    resendIn: Option.match(sent, { onNone: () => 0, onSome: (code) => code.resendIn }),
     resend: command((flow) => () => flow.resend),
     differentEmail: command((flow) => () => flow.differentEmail),
     continueWith: command((flow) => flow.continueWith),
-    sending: running === 'send',
-    checking: running === 'code',
-    provider: Option.fromUndefinedOr(returning ?? leaving),
-    busy: running !== undefined || returning !== undefined,
+    startOver: command((flow) => () => flow.startOver),
+    sending: state._tag === 'Sending' || state._tag === 'Resending',
+    checking: state._tag === 'Checking',
+    provider: Option.fromUndefinedOr(returning ?? (state._tag === 'Leaving' ? state.provider : undefined)),
+    busy: (state._tag !== 'Email' && state._tag !== 'Code') || returning !== undefined,
     codeFailure: wrongCode ? Option.some(failure as WrongCodeOf<E>) : Option.none(),
     alert: failure !== undefined && !wrongCode ? Option.some(failure as Exclude<E, { readonly _tag: 'WrongCode' }>) : Option.none(),
   };

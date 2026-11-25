@@ -1,6 +1,6 @@
 {
   "name": "@misofm/privy-auth",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Privy sign-in shared by Miso's apps, in Effect: the embedded Sui wallet, Privy's failures, its config, identity tokens verified on the server, and the sign-in screen's hooks and parts.",
   "license": "MIT",
   "repository": {
@@ -42,7 +42,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test --coverage",
     "pack": "bun run build && mkdir -p dist-pack && bun pm pack --filename dist-pack/misofm-privy-auth.tgz",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run typecheck && bun run test && bun run build"
   },
   "peerDependencies": {
     "@mysten/sui": "2.38.0",
