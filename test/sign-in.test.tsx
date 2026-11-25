@@ -1,12 +1,12 @@
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import { act, cleanup, renderHook } from '@testing-library/react';
+import { act, cleanup, render, renderHook } from '@testing-library/react';
 import { type Context, Deferred, Effect, Layer, Option } from 'effect';
 import { TestClock } from 'effect/testing';
-import { StrictMode } from 'react';
+import { Activity, StrictMode } from 'react';
 
 import { CodeNotSent, WrongCode } from '../src/failure.js';
-import { type SignInActions, useSignIn, type UseSignInOptions } from '../src/react.js';
+import { type SignIn, type SignInActions, useSignIn, type UseSignInOptions } from '../src/react.js';
 
 type Failure = WrongCode | CodeNotSent;
 
@@ -40,12 +40,12 @@ describe('useSignIn', () => {
     const runtime = await testRuntime();
     const { calls, actions } = actionsOf();
     const { result } = renderHook(() => useSignIn(actions, { run: runtime.run }));
-    expect(result.current).toMatchObject({ step: 'email', email: '', busy: false, codeLength: 6, resendIn: 0 });
-    act(() => result.current.setEmail('artist@example.com'));
-    expect(result.current.email).toBe('artist@example.com');
+    expect(result.current).toMatchObject({ state: { _tag: 'Email' }, step: 'email', email: '', busy: false, codeLength: 6, resendIn: 0, sentTo: Option.none(), code: '' });
+    act(() => result.current.setEmail(' artist@example.com'));
+    expect(result.current.email).toBe(' artist@example.com');
     act(() => result.current.submitEmail());
     await flush();
-    expect(result.current).toMatchObject({ step: 'code', resendIn: 30, sending: false });
+    expect(result.current).toMatchObject({ state: { _tag: 'Code' }, step: 'code', resendIn: 30, sending: false, sentTo: Option.some('artist@example.com') });
     await runtime.adjust('12 seconds');
     expect(result.current.resendIn).toBe(18);
     await runtime.adjust('18 seconds');
@@ -94,6 +94,26 @@ describe('useSignIn', () => {
     expect(result.current.step).toBe('email');
   });
 
+  test('an accepted code is spent: the field emptied, the screen takes input, Resend at once; Start Over is the email step', async () => {
+    const runtime = await testRuntime();
+    const { calls, actions } = actionsOf();
+    const { result } = renderHook(() => useSignIn(actions, { run: runtime.run }));
+    act(() => result.current.setEmail('artist@example.com'));
+    act(() => result.current.submitEmail());
+    await flush();
+    act(() => result.current.submitCode('123456'));
+    await flush();
+    expect(result.current).toMatchObject({ state: { _tag: 'Code' }, busy: false, checking: false, step: 'code', code: '', resendIn: 0, codeFailure: Option.none(), alert: Option.none() });
+    // The spent code isn't checked again; another is sent at once.
+    act(() => result.current.submitCode());
+    act(() => result.current.resend());
+    await flush();
+    expect(calls).toEqual(['send artist@example.com', 'code 123456', 'send artist@example.com']);
+    expect(result.current.resendIn).toBe(30);
+    act(() => result.current.startOver());
+    expect(result.current).toMatchObject({ state: { _tag: 'Email' }, busy: false, step: 'email', email: 'artist@example.com', sentTo: Option.some('artist@example.com') });
+  });
+
   test('Google: its button busy, and the screen; returning from Apple: Apple’s, nothing starts', async () => {
     const runtime = await testRuntime();
     const { calls, actions } = actionsOf();
@@ -112,6 +132,45 @@ describe('useSignIn', () => {
     await flush();
     expect(result.current.email).toBe('artist@example.com');
     expect(calls).toEqual(['oauth google']);
+  });
+
+  test('hidden while a code is being sent (its effects unmounted): the send is interrupted; shown again, the screen takes input, whatever the old send still does', async () => {
+    const runtime = await testRuntime();
+    const gate = Effect.runSync(Deferred.make<void, Failure>());
+    // A send whose own clean-up takes a while: it ends after the screen is back.
+    const ended: string[] = [];
+    let release = () => {};
+    const cleanedUp = new Promise<void>((resolve) => (release = resolve));
+    const send = Deferred.await(gate).pipe(Effect.ensuring(Effect.promise(() => (ended.push('interrupted'), cleanedUp.then(() => void ended.push('cleaned up'))))));
+    const { calls, actions } = actionsOf({ send });
+    const result = { current: undefined as unknown as SignIn<Failure> };
+    function Screen() {
+      result.current = useSignIn(actions, { run: runtime.run });
+      return null;
+    }
+    const screen = (mode: 'visible' | 'hidden') => (
+      <Activity mode={mode}>
+        <Screen />
+      </Activity>
+    );
+    const { rerender } = render(screen('visible'));
+    act(() => result.current.setEmail('artist@example.com'));
+    act(() => result.current.submitEmail());
+    expect(result.current).toMatchObject({ sending: true, busy: true });
+    rerender(screen('hidden'));
+    await flush();
+    expect(ended).toEqual(['interrupted']);
+    rerender(screen('visible'));
+    await flush();
+    expect(result.current).toMatchObject({ state: { _tag: 'Email' }, sending: false, busy: false, email: 'artist@example.com' });
+    act(() => result.current.setEmail('changed@example.com'));
+    // The old send ends now: what its flow says is no longer the screen's.
+    release();
+    await flush();
+    expect(ended).toEqual(['interrupted', 'cleaned up']);
+    expect(result.current.email).toBe('changed@example.com');
+    act(() => result.current.submitEmail());
+    expect(calls).toEqual(['send artist@example.com', 'send changed@example.com']);
   });
 
   test('the latest actions run; unmounted (StrictMode’s too), nothing runs or changes', async () => {

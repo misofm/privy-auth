@@ -4,15 +4,17 @@
  * `useSignIn` is the screen's state machine over the app's own actions. React is a peer, and
  * `@privy-io/react-auth` for `usePrivyActions` only.
  */
-export { type PrivyActions, type PrivyActionsCallbacks, PrivyCallFailed, usePrivyActions } from './privy-actions.js';
+export { type PrivyActions, type PrivyActionsCallbacks, PrivyCallFailed, type PrivySession, usePrivyActions } from './privy-actions.js';
 export { type RunSignIn, type SignIn, useSignIn, type UseSignInOptions } from './sign-in.js';
 export {
   CODE_LENGTH,
   type EmailProblem,
   isEmailAddress,
   RESEND_SECONDS,
+  type SentCode,
+  type ShownFailure,
   type SignInActions,
-  type SignInRunning,
+  type SignInFlowState,
   type SignInStep,
   type TaggedFailure,
   type WrongCodeOf,

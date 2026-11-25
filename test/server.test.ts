@@ -82,6 +82,9 @@ describe('verifyIdentityToken', () => {
     expect(await rejection(await token({ linked_accounts: JSON.stringify([{ type: 'email', address: 'a@example.com' }]) }))).toBe('NoSuiWallet');
     expect(await rejection(await token({ linked_accounts: JSON.stringify([{ ...wallet, wallet_client_type: 'phantom' }]) }))).toBe('NoSuiWallet');
     expect(await rejection(await token({ linked_accounts: undefined }))).toBe('NoSuiWallet');
+    // A wallet whose address isn't one is no wallet; the next that is one counts.
+    for (const bad of ['not hex', '0x', `0x${'ab'.repeat(33)}`]) expect(await rejection(await token({ linked_accounts: JSON.stringify([{ ...wallet, address: bad }]) }))).toBe('NoSuiWallet');
+    expect(await verify(await token({ linked_accounts: JSON.stringify([{ ...wallet, address: 'not hex' }, wallet]) }))).toMatchObject({ address });
   });
 
   test('a bad signature: another key’s, tampered claims, a key WebCrypto won’t verify with', async () => {
@@ -115,6 +118,7 @@ describe('verifyIdentityToken', () => {
     expect(await rejection(`${b64url('not json')}.${body}.${signature}`)).toBe('Malformed');
     expect(await rejection(`${head}.${b64url('[]')}.${signature}`)).toBe('Malformed');
     expect(await rejection(await token({ sub: undefined }))).toBe('Malformed');
+    expect(await rejection(await token({ sub: '' }))).toBe('Malformed');
     expect(await rejection(await token({ exp: 'soon' }))).toBe('Malformed');
     expect(await rejection(await token({ linked_accounts: '[' }))).toBe('Malformed');
   });
@@ -189,50 +193,123 @@ describe('PrivyKeys.layerJwks', () => {
     expect(seen).toMatchObject({ success: { results: [true, true, false, false], fetchesBefore: 1, tooSoon: false, fetchesSoon: 1, later: true, fetchesLater: 2 } });
   });
 
-  test('a failed fetch is PrivyKeysUnavailable, and tried again next time', async () => {
-    let fail = true;
-    const { asked, layer } = keysOf(() => (fail ? new Response('down', { status: 503 }) : Response.json({ keys: [{ ...jwk, kid: 'k1' }] })));
+  /** `effect` forked, the clock moved past every retry, then its outcome. */
+  const afterRetries = <A, E>(effect: Effect.Effect<A, E, PrivyKeys>) =>
+    Effect.gen(function* () {
+      const pending = yield* Effect.forkChild(effect);
+      yield* TestClock.adjust('1 second');
+      return yield* Fiber.join(pending);
+    });
+
+  test('a fetch with no answer, a 5xx or a 429 is tried again, twice at most; still failing, it is PrivyKeysUnavailable and not kept', async () => {
+    let answers: Array<() => Response | Promise<Response>> = [() => Promise.reject(new TypeError('Failed to fetch')), () => new Response('slow down', { status: 429 })];
+    const { asked, layer } = keysOf(() => (answers.shift() ?? (() => Response.json({ keys: [{ ...jwk, kid: 'k1' }] })))());
+    expect(await run(afterRetries(has('k1')), layer)).toMatchObject({ success: true });
+    expect(asked.length).toBe(3);
+
+    const down = keysOf(() => (answers.shift() ?? (() => new Response('down', { status: 503 })))());
     const outcome = await run(
       Effect.gen(function* () {
-        const first = yield* Effect.flip(has('k1'));
-        fail = false;
-        return { first: first._tag, then: yield* has('k1') };
+        const first = yield* afterRetries(Effect.flip(has('k1')));
+        const fetches = down.asked.length;
+        answers = [() => Response.json({ keys: [{ ...jwk, kid: 'k1' }] })];
+        return { first: first._tag, cause: String(first.cause), fetches, then: yield* has('k1') };
+      }),
+      down.layer,
+    );
+    expect(outcome).toMatchObject({ success: { first: 'PrivyKeysUnavailable', cause: 'Error: HTTP 503', fetches: 3, then: true } });
+    expect(down.asked.length).toBe(4);
+  });
+
+  test('a fetch for an unknown kid that fails takes no key away: known keys verify, and only that token fails, for the minute', async () => {
+    let down = false;
+    let served: object[] = [{ ...jwk, kid: 'k1' }];
+    const { asked, layer } = keysOf(() => (down ? new Response('down', { status: 503 }) : Response.json({ keys: served })));
+    const unknown = Effect.map(Effect.result(has('k2')), (result) => (result._tag === 'Success' ? result.success : result.failure._tag));
+    const seen = await run(
+      Effect.gen(function* () {
+        const before = yield* has('k1');
+        down = true;
+        yield* TestClock.adjust('61 seconds');
+        const failed = yield* afterRetries(unknown);
+        const fetches = asked.length;
+        const known = yield* has('k1');
+        const again = yield* unknown;
+        const quiet = asked.length === fetches;
+        down = false;
+        served = [{ ...jwk, kid: 'k1' }, { ...jwk, kid: 'k2' }];
+        yield* TestClock.adjust('60 seconds');
+        return { before, failed, fetches, known, again, quiet, later: yield* unknown, fetchesLater: asked.length };
       }),
       layer,
     );
-    expect(outcome).toMatchObject({ success: { first: 'PrivyKeysUnavailable', then: true } });
-    expect(asked.length).toBe(2);
+    expect(seen).toMatchObject({ success: { before: true, failed: 'PrivyKeysUnavailable', fetches: 4, known: true, again: 'PrivyKeysUnavailable', quiet: true, later: true, fetchesLater: 5 } });
   });
 
-  test('a JWKS that isn’t one, a body that isn’t JSON, no answer, or a key that won’t import, is PrivyKeysUnavailable', async () => {
-    const answers = [
-      () => Response.json({}),
-      () => Response.json({ keys: [{ ...jwk, kid: 'k1', x: 'AAAA' }] }),
-      () => new Response('not json'),
-      () => Promise.reject(new TypeError('Failed to fetch')),
-    ];
+  test('unknown kids asked for together share one fetch', async () => {
+    let served: object[] = [{ ...jwk, kid: 'k1' }];
+    const { asked, layer } = keysOf(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return Response.json({ keys: served });
+    });
+    const seen = await run(
+      Effect.gen(function* () {
+        const first = yield* Effect.all([has('k1'), has('k1')], { concurrency: 'unbounded' });
+        const fetchesFirst = asked.length;
+        served = [{ ...jwk, kid: 'k2' }, { ...jwk, kid: 'k3' }];
+        yield* TestClock.adjust('61 seconds');
+        const both = yield* Effect.all([has('k2'), has('k3')], { concurrency: 'unbounded' });
+        return { first, fetchesFirst, both, fetches: asked.length };
+      }),
+      layer,
+    );
+    expect(seen).toMatchObject({ success: { first: [true, true], fetchesFirst: 1, both: [true, true], fetches: 2 } });
+  });
+
+  test('a refusal, a body that isn’t JSON or a JWKS that isn’t one is PrivyKeysUnavailable at once', async () => {
+    const answers = [() => new Response('no such app', { status: 404 }), () => new Response('not json'), () => Response.json({})];
     for (const answer of answers) {
-      const { layer } = keysOf(answer);
+      const { asked, layer } = keysOf(answer);
       expect(await run(Effect.flip(has('k1')), layer)).toMatchObject({ success: { _tag: 'PrivyKeysUnavailable' } });
+      expect(asked.length).toBe(1);
     }
   });
 
-  test('a JWKS that doesn’t answer in 5 s (TestClock) is PrivyKeysUnavailable, its request aborted', async () => {
-    let aborted = false;
+  test('a key that won’t import is skipped; a JWKS with no key that can verify is PrivyKeysUnavailable', async () => {
+    const broken = { ...jwk, kid: 'broken', x: 'AAAA' };
+    const mixed = keysOf(() => Response.json({ keys: [broken, { ...jwk, kid: 'k1' }] }));
+    expect(await run(Effect.all([has('k1'), has('broken')]), mixed.layer)).toMatchObject({ success: [true, false] });
+    for (const keys of [[broken], [{ kty: 'RSA', kid: 'rsa' }], []]) {
+      const { layer } = keysOf(() => Response.json({ keys }));
+      const outcome = await run(Effect.flip(has('k1')), layer);
+      expect(outcome).toMatchObject({ success: { _tag: 'PrivyKeysUnavailable' } });
+      expect(outcome._tag === 'Success' && String(outcome.success.cause)).toContain('no key that can verify');
+    }
+  });
+
+  test('a JWKS that doesn’t answer: each try aborted after 2 s, PrivyKeysUnavailable after 5 s in all (TestClock)', async () => {
+    let asked = 0;
+    let aborted = 0;
     const fetch: Fetch = (_, { signal }) =>
       new Promise(() => {
-        signal.addEventListener('abort', () => (aborted = true));
+        asked++;
+        signal.addEventListener('abort', () => aborted++);
       });
     const outcome = await run(
       Effect.gen(function* () {
         const pending = yield* Effect.forkChild(Effect.flip(has('k1')));
-        yield* TestClock.adjust('5 seconds');
-        return yield* Fiber.join(pending);
+        yield* TestClock.adjust('2 seconds');
+        const first = { asked, aborted };
+        yield* TestClock.adjust('2999 millis');
+        const waiting = pending.pollUnsafe() === undefined;
+        yield* TestClock.adjust('1 millis');
+        const failure = yield* Fiber.join(pending);
+        return { first, waiting, failure: [failure._tag, String(failure.cause)] };
       }),
       PrivyKeys.layerJwks('app', { fetch }),
     );
-    expect(outcome).toMatchObject({ success: { _tag: 'PrivyKeysUnavailable' } });
-    expect(aborted).toBe(true);
+    expect(outcome).toMatchObject({ success: { first: { asked: 1, aborted: 1 }, waiting: true, failure: ['PrivyKeysUnavailable', 'Error: No answer in 5 seconds'] } });
+    expect([asked, aborted]).toEqual([3, 3]);
   });
 
   test('the global fetch by default', async () => {
